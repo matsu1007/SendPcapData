@@ -1,18 +1,30 @@
-# send_pcap.py 内部構造
+# send_pcap 内部構造
 
-`send_pcap.py` の実装を理解するための技術ドキュメントです。使い方は [README.md](README.md) を参照してください。
+`send_pcap.py` とその周辺モジュールの実装を理解するための技術ドキュメントです。使い方は [README.md](README.md) を参照してください。
+
+## ファイル構成
+
+モードごとにファイルを分割している（フラットなモジュール構成で、パッケージ化はしていない）。`python send_pcap.py ...` という起動方法はこの分割の影響を受けない。
+
+| ファイル | 役割 |
+| --- | --- |
+| `send_pcap.py` | エントリポイント。argparseの定義・バリデーション・各モードへの振り分け（`main()`）のみを持つ |
+| `pcap_filters.py` | 3モード共通のフィルタ・待機処理 |
+| `basic_mode.py` | 基本モードの実装 |
+| `tcp_session_mode.py` | `--tcp-session` の実装 |
+| `tcp_raw_session_mode.py` | `--tcp-raw-session` の実装（自前TCPハンドシェイク・ARP応答など） |
 
 ## 全体像
 
-`main()` の末尾で、指定されたモードに応じて3つの経路のいずれかに分岐します（優先順位は `--tcp-raw-session` > `--tcp-session` > 基本モード）。
+`send_pcap.py` の `main()` の末尾で、指定されたモードに応じて3つの経路のいずれかに分岐する（優先順位は `--tcp-raw-session` > `--tcp-session` > 基本モード）。
 
 ```
---tcp-raw-session が指定されている → replay_raw_tcp_session()  （生パケットでTCPヘッダごとファジングを再現）
---tcp-session が指定されている     → replay_tcp_session() / replay_tcp_session_until_disconnect()  （通常socketでペイロードのファジングを再現）
-どちらも指定なし                    → 基本モードのループ（generate_rewrite_packet + send_packet）
+--tcp-raw-session が指定されている → tcp_raw_session_mode.replay_raw_tcp_session()  （生パケットでTCPヘッダごとファジングを再現）
+--tcp-session が指定されている     → tcp_session_mode.replay_tcp_session() / replay_tcp_session_until_disconnect()  （通常socketでペイロードのファジングを再現）
+どちらも指定なし                    → basic_mode.run_basic_mode()
 ```
 
-3モードは実装難易度・必要権限が異なります。
+3モードは実装難易度・必要権限が異なる。
 
 | モード | 通信方式 | 管理者権限/Npcap | 用途 |
 | --- | --- | --- | --- |
@@ -20,7 +32,7 @@
 | `--tcp-session` | 通常の`socket` | 不要 | TCPペイロード（アプリ層データ）のファジング再現 |
 | `--tcp-raw-session` | 生パケット＋自前ハンドシェイク | 必要 | TCPヘッダ自体（フラグ/window/urgent pointer/予約ビット/seq・ack）のファジング再現 |
 
-## 共通ユーティリティ
+## 共通ユーティリティ（`pcap_filters.py`）
 
 ### `packet_matches_src(pkt, src_ip, src_mac, src_port=None)`
 
@@ -30,7 +42,7 @@
 
 `--realtime`（pcap記録時の間隔を再現）と `--interval`（固定間隔）の共通処理。`--tcp-session` と `--tcp-raw-session` の両方から呼ばれる。
 
-## 基本モード
+## 基本モード（`basic_mode.py`）
 
 ### `rewrite_packet(pkt, dst_ip, dst_port, dst_mac, keep_checksum)`
 
@@ -46,11 +58,11 @@
 
 Ethernetヘッダの有無で `sendp`（L2送信）と `send`（L3送信）を切り替える。
 
-### 実行ループ（`main()` 末尾）
+### `run_basic_mode(...)`
 
-`--loop` 回、`PcapReader` でpcap全体を毎回読み直し、`packet_matches_src` → `rewrite_packet` → `send_packet`（または `--dry-run` なら `pkt.show()`）という単純なパイプライン。
+`--loop` 回、`PcapReader` でpcap全体を毎回読み直し、`packet_matches_src` → `rewrite_packet` → `send_packet`（または `--dry-run` なら `pkt.show()`）という単純なパイプライン。`send_pcap.py` の `main()` から呼ばれる。
 
-## `--tcp-session`（ペイロードのファジング再現）
+## `--tcp-session`（ペイロードのファジング再現、`tcp_session_mode.py`）
 
 ### `extract_tcp_payloads(pcap_path, src_ip, src_mac, src_port)`
 
@@ -66,7 +78,7 @@ pcapを1回走査し、Device AのTCPペイロード（`bytes(pkt[TCP].payload)`
 
 同じ接続を張ったまま `payloads` を無限にループ送信し続ける。`sendall()` が `OSError` を送出した時点（TCP送信バッファの都合で実際の切断より遅れて検知されることがある）で「対象がクラッシュ/再起動した」とみなし、何周目・何件目で切断されたかを報告する。
 
-## `--tcp-raw-session`（TCPヘッダのファジング再現）
+## `--tcp-raw-session`（TCPヘッダのファジング再現、`tcp_raw_session_mode.py`）
 
 3モードの中で最も複雑。**自前でTCPクライアントのハンドシェイク処理を実装**している。通常の`socket`ではTCPフラグ・window・urgent pointer・予約ビットを直接操作できず、かつ対象デバイスは異常パケットを「実際に確立されたセッションのseq/ackに整合していないと受理しない」という制約のため、この方式が必要になった。
 
