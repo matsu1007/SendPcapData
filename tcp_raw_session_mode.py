@@ -145,6 +145,27 @@ def find_crash_stream_index(streams):
     return last_index_with_response
 
 
+def followups_signature(followups):
+    """followups列の「内容」を比較するための署名を返す。フラグ/window/urgent pointer/
+    予約ビット/ペイロードだけを見て、seq/ack（接続ごとのISNに依存し必然的に変わる）や
+    delay（実測タイミングのゆらぎ）は無視する。同一ファジングデータをポートだけ変えて
+    繰り返し送っているケースで、接続間の内容が同じかどうかを判定するために使う。
+    """
+    sig = []
+    for item in followups:
+        tcp = item["pkt"][TCP]
+        sig.append((int(tcp.flags), tcp.window, tcp.urgptr, tcp.reserved, bytes(tcp.payload)))
+    return tuple(sig)
+
+
+def format_port_list(ports):
+    if len(ports) <= 10:
+        return ", ".join(str(p) for p in ports)
+    head = ", ".join(str(p) for p in ports[:5])
+    tail = ", ".join(str(p) for p in ports[-5:])
+    return f"{head}, ...（他{len(ports) - 10}件）..., {tail}"
+
+
 def print_crash_summary(streams):
     total = len(streams)
     crash_index = find_crash_stream_index(streams)
@@ -333,6 +354,27 @@ def replay_raw_tcp_sessions(
 
     if dry_run:
         print(f"[dry-run] 送信元IP {spoof_ip} を名乗り、各接続ごとに新しいSYNでハンドシェイクする想定です")
+
+        signatures = {followups_signature(s["followups"]) for s in replayable}
+        all_same_content = len(signatures) == 1 and len(replayable) > 1
+
+        if all_same_content:
+            template = replayable[0]
+            ports = [s["local_port"] for s in replayable]
+            print(
+                f"全 {len(replayable)} 件の接続でファジング内容は同一です。代表として1件分の内容を表示します"
+                "（実際の送信ではseq/ackが各接続のISNに合わせて自動調整されます）:"
+            )
+            for i, item in enumerate(template["followups"], start=1):
+                tcp = item["pkt"][TCP]
+                payload = bytes(tcp.payload)
+                print(
+                    f"    [{i}] flags={describe_tcp_flags(tcp)} window={tcp.window} "
+                    f"urgptr={tcp.urgptr} reserved={tcp.reserved} payload={payload!r}"
+                )
+            print(f"使用される送信元ポート（{len(ports)}件）: {format_port_list(ports)}")
+            return
+
         for stream_no, stream in enumerate(replayable, start=1):
             local_port = local_port_override or stream["local_port"]
             this_dst_port = dst_port or stream["remote_port"]

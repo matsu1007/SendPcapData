@@ -99,6 +99,13 @@ pcapを1回走査しながら、複数ストリームを並行して追跡する
 - `find_crash_point` は1つのストリーム内で、最後に応答があった followup のインデックス（1始まり）を返す（`--dry-run` の各ストリーム表示で使用）。
 - `find_crash_stream_index` はストリームのリスト全体から、最後に何らかの応答（SYN-ACKまたはフォローアップへの応答）があったストリームのインデックス（0始まり）を返す。`print_crash_summary` がこれを使い、「元のpcapでは何件目の接続まで応答があったか」を表示する。
 
+### `followups_signature(followups)` / `format_port_list(ports)`
+
+ファジングテストは同じ内容のパケットをポートだけ変えて繰り返し送ることが多いため、`--dry-run` は全接続の内容が同一かどうかを判定し、同一なら代表1件だけを表示して冗長な繰り返し表示を避ける。
+
+- `followups_signature` は followups から `(flags, window, urgptr, reserved, payload)` のタプル列を作る。seq/ack（接続ごとのISNに依存して必然的に変わる）と delay（実測タイミングのゆらぎ）は比較対象から除外する。`replay_raw_tcp_sessions` はこの署名が全ストリームで一致するかを見て、表示を「代表1件+ポート一覧」にするか「接続ごとの詳細」にするかを切り替える。
+- `format_port_list` はポート番号のリストを表示用に整形する。10件以下ならすべて、それより多ければ先頭5件・末尾5件と省略件数を表示する。
+
 ### `ArpResponder`（コンテキストマネージャ）
 
 `--spoof-ip` で名乗る送信元IPアドレス宛のARP who-has要求に、実際のMACアドレス（`get_if_hwaddr(iface)`）で応答し続けるバックグラウンドスレッド。**全ストリームの再現中、1インスタンスだけ起動したまま使い回す**（ストリームごとに起動し直さない）。
