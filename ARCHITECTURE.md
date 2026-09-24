@@ -82,25 +82,26 @@ pcapを1回走査し、Device AのTCPペイロード（`bytes(pkt[TCP].payload)`
 
 3モードの中で最も複雑。**自前でTCPクライアントのハンドシェイク処理を実装**している。通常の`socket`ではTCPフラグ・window・urgent pointer・予約ビットを直接操作できず、かつ対象デバイスは異常パケットを「実際に確立されたセッションのseq/ackに整合していないと受理しない」という制約のため、この方式が必要になった。
 
-### 抽出フェーズ: `extract_raw_tcp_stream(pcap_path, src_ip, src_mac, src_port)`
+元のファジングテストは、テストケースごとに送信元ポートを変えて新しいTCP接続を張り直す作りであることが多い。そのため、pcapからは単一のストリームではなく**Device Aが張ったすべてのストリームを出現順に抽出**し、後段で1つずつ同じ手順（自前ハンドシェイク→フォローアップ送信）で再現する。
 
-pcapを1回走査しながら、状態を進める小さな状態機械になっている。
+### 抽出フェーズ: `extract_raw_tcp_streams(pcap_path, src_ip, src_mac)`
 
-1. **`local_isn` 未確定の間**: Device AからのSYN（SYN=1, ACK=0）を探す。見つかったら `local_isn`（元のISN）・`local_port`・`remote_port`・`remote_ip` を記録。
-2. **`remote_isn` 未確定の間**: 手順1で特定した相手からのSYN-ACK（SYN=1, ACK=1）を探し、`remote_isn` を記録。
-3. **それ以降**: パケットをDevice A由来／Device B由来に振り分ける。
-   - Device B由来（応答）: 直前に追加された `followups` の要素の `"responses"` リストに追加する。
-   - Device A由来: ハンドシェイクを完了させるだけの素のACK（`flags == ACK_FLAG` かつペイロード空、最初の1回だけ）は除外し、それ以外は `followups` に `{"delay":..., "pkt":..., "responses": []}` として追加する。
+pcapを1回走査しながら、複数ストリームを並行して追跡する状態機械になっている。`active_by_key` は `(local_port, remote_port)` をキーに「現在追跡中のストリーム」を指す辞書。
 
-戻り値の `followups` は、後段の送信フェーズでそのままオフセット付きで再送される「異常ヘッダを持つパケット列」であり、各要素の `"responses"` は元のpcapでの対象機の反応（あれば）。
+1. Device AからのSYN（SYN=1, ACK=0）が来るたびに、**新しいストリーム**を1つ作って `streams` に追加し、`active_by_key[key]` をそれに差し替える。同じポートが後から再利用されていても、新しいSYNが来た時点で古いストリームへの参照は `active_by_key` から外れ、以降のパケットは新しい方に紐付く。
+2. 応答（`reply_key = (dport, sport)` で該当ストリームを検索）は、ストリームの `remote_isn` が未確定ならSYN-ACKとして、確定済みなら直前の `followups` 要素への `"responses"` として記録する。
+3. Device A由来でストリームに属するそれ以降のパケットは、ハンドシェイクを完了させるだけの素のACK（最初の1回だけ）を除いて `followups` に `{"delay":..., "pkt":..., "responses": []}` として追加する。
 
-### `find_crash_point(followups)`
+各ストリームの `remote_isn` が `None` のままなら、そのストリームは元のpcapでSYN-ACKが一度も返ってこなかった（＝対象が応答しなかった）ことを意味し、クラッシュ地点の推定に使う。
 
-`followups` の中で最後に `"responses"` が非空だった要素のインデックス（1始まり）を返す。これを `total_followups` と比較することで、「元のpcapでは何回目の送信まで応答があったか＝クラッシュ推定地点」を求める。`--dry-run` 時に参考情報として表示される。
+### `find_crash_point(followups)` / `find_crash_stream_index(streams)`
+
+- `find_crash_point` は1つのストリーム内で、最後に応答があった followup のインデックス（1始まり）を返す（`--dry-run` の各ストリーム表示で使用）。
+- `find_crash_stream_index` はストリームのリスト全体から、最後に何らかの応答（SYN-ACKまたはフォローアップへの応答）があったストリームのインデックス（0始まり）を返す。`print_crash_summary` がこれを使い、「元のpcapでは何件目の接続まで応答があったか」を表示する。
 
 ### `ArpResponder`（コンテキストマネージャ）
 
-`--spoof-ip` で名乗る送信元IPアドレス宛のARP who-has要求に、実際のMACアドレス（`get_if_hwaddr(iface)`）で応答し続けるバックグラウンドスレッド。
+`--spoof-ip` で名乗る送信元IPアドレス宛のARP who-has要求に、実際のMACアドレス（`get_if_hwaddr(iface)`）で応答し続けるバックグラウンドスレッド。**全ストリームの再現中、1インスタンスだけ起動したまま使い回す**（ストリームごとに起動し直さない）。
 
 背景: 送信元IPを自分（Windows機）の実IPにすると、対象からのSYN-ACKを見てWindows自身のTCP/IPスタックが「身に覚えのない接続」と判断し、自動的にRSTを送り返してセッションを壊してしまう。これを避けるため、このマシンに割り当てられていないIP（`--spoof-ip`）を名乗る。その代償として、対象機は偽装IPのMACアドレスをARPで問い合わせてくるため、`ArpResponder` が自動応答する。
 
@@ -110,18 +111,21 @@ pcapを1回走査しながら、状態を進める小さな状態機械になっ
 
 生パケットの送信（`send`/`sendp`）は fire-and-forget で失敗が返ってこないため、`--until-disconnect` でのクラッシュ検知には使えない。そのため、生セッションとは**別の、独立した通常`socket`接続**を試みることで対象への疎通を確認する。
 
+### `establish_stream_session(...)`
+
+1ストリームぶんの自前ハンドシェイク（SYN送信→`sr1()`でSYN-ACK受信→ACK送信）を行い、`(offset_local, offset_remote)` を返す。`offset_local = new_local_isn - stream["local_isn"]`、`offset_remote = new_remote_isn - stream["remote_isn"]`（いずれも `mod 2**32`）。元のpcapのseq/ack値にこのオフセットを足すことで、新しいセッションのISNを基準にした値へ読み替える。SYN-ACKが返らなければ `None` を返す。
+
 ### `send_raw_followups_round(...)`
 
-`followups` を1周ぶん送信する。各要素の `seq`/`ack` に `offset_local`/`offset_remote`（後述）を加算した新しい値を使い、フラグ・window・urgent pointer・予約ビット・オプションは元のまま `IP()/TCP()` を新規構築して送信する。戻り値は送信件数（`--until-disconnect` の累計カウントに使う）。
+1ストリームの `followups` を1周ぶん送信する。各要素の `seq`/`ack` に上記のオフセットを加算した新しい値を使い、フラグ・window・urgent pointer・予約ビット・オプションは元のまま `IP()/TCP()` を新規構築して送信する。戻り値は送信件数。
 
-### 送信フェーズ: `replay_raw_tcp_session(...)`
+### 送信フェーズ: `replay_raw_tcp_sessions(...)`
 
-1. `extract_raw_tcp_stream` で元セッション情報を復元し、`find_crash_point` の結果を表示する。
-2. `--dry-run` ならここで打ち切り、各 followup とその元の応答を表示して終了する。
-3. `ArpResponder` を起動した状態で、自前のSYN（ランダムな `new_local_isn`）を `sr1()` で送信し、SYN-ACKを受信する。
-4. SYN-ACKから得た `new_remote_isn` を使ってACKを送信し、ハンドシェイクを完了させる。
-5. **オフセット計算**: `offset_local = new_local_isn - stream["local_isn"]`、`offset_remote = new_remote_isn - stream["remote_isn"]`（いずれも `mod 2**32`）。元のpcapのseq/ack値にこのオフセットを足すことで、新しいセッションのISNを基準にした値へ読み替える。
-6. `until_disconnect` が偽なら `send_raw_followups_round` を1回呼んで終了。真なら、周回ごとに `probe_target_alive` で生存確認しながら無限ループし、疎通が取れなくなった時点で停止・報告する。
+1. `extract_raw_tcp_streams` で全ストリームを復元し、`--src-port` が指定されていればそのポートのストリーム1件に絞り込む。`print_crash_summary` でクラッシュ推定地点を表示する。
+2. `followups` が空のストリーム（SYNのみで応答が無い等）は再現対象から除外する（`replayable` リスト）。
+3. `--dry-run` ならここで打ち切り、ストリームごとに再現対象パケットとその元の応答を表示して終了する。
+4. `ArpResponder` を1つ起動した状態で、`replayable` の各ストリームを順番に処理する: `establish_stream_session` → `send_raw_followups_round`。ストリーム間には（`--interval`/`--realtime` に応じて）元のpcapでのSYN同士の間隔を再現する待機を挟む。
+5. `until_disconnect` が真なら、`replayable` 全体を送り終えるたびに最初から繰り返す。**各ストリームの送信直後**に `probe_target_alive` で生存確認し、失敗した時点で「何周目・何件目のストリームで停止したか」を報告して終了する（`--tcp-session` 版が「1周＝1セッション内の全ペイロード」単位で確認するのに対し、こちらは「1ストリーム＝1接続」単位で確認しており、より細かい粒度でクラッシュ地点を特定できる）。
 
 ## 主要な設計判断のまとめ
 

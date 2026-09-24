@@ -7,7 +7,7 @@ import sys
 from scapy.all import get_if_list
 
 from basic_mode import run_basic_mode
-from tcp_raw_session_mode import replay_raw_tcp_session
+from tcp_raw_session_mode import replay_raw_tcp_sessions
 from tcp_session_mode import extract_tcp_payloads, replay_tcp_session, replay_tcp_session_until_disconnect
 
 
@@ -94,7 +94,7 @@ def main():
             parser.error("--tcp-raw-session には --spoof-ip（対象と同じサブネット上の未使用IP）が必要です")
         if args.until_disconnect and args.dry_run:
             parser.error("--until-disconnect と --dry-run は併用できません（実接続なしでは生存確認ができないため）")
-        replay_raw_tcp_session(
+        replay_raw_tcp_sessions(
             args.pcap,
             args.src_ip,
             args.src_mac,
