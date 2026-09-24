@@ -295,6 +295,69 @@ def establish_stream_session(stream, spoof_ip, dst_ip, dst_port, local_port, ifa
     return offset_local, offset_remote
 
 
+def replay_stream_worker(stream, spoof_ip, dst_ip, dst_port_override, local_port_override, interval, realtime, iface, timeout, label):
+    """1ストリームぶんのハンドシェイク＋followups送信を行う。スレッドの実行単位。"""
+    local_port = local_port_override or stream["local_port"]
+    this_dst_port = dst_port_override or stream["remote_port"]
+    print(f"[{label}] local_port={local_port} でハンドシェイクを開始します")
+
+    offsets = establish_stream_session(stream, spoof_ip, dst_ip, this_dst_port, local_port, iface, timeout)
+    if offsets is None:
+        return False
+    offset_local, offset_remote = offsets
+
+    send_raw_followups_round(
+        stream, spoof_ip, dst_ip, this_dst_port, local_port, offset_local, offset_remote, interval, realtime, iface
+    )
+    return True
+
+
+def replay_streams_concurrently(streams, spoof_ip, dst_ip, dst_port_override, local_port_override, interval, realtime, iface, timeout, pass_num):
+    """元のpcapで複数の接続が同時にオープンになっていた状態（次の接続が始まるまでに
+    前の接続が閉じきっていない）を再現するため、streamsの各ストリームを別スレッドで
+    並行に実行する。
+
+    スレッドの開始タイミングは以下の通り:
+      - realtime指定時: 元のpcapでの最初のSYNからの相対時間（"syn_time"の差）通りに開始する。
+        これにより、元の接続同士の重なり方をできる限り正確に再現する。
+      - interval指定時（realtimeなし）: 前の接続の開始からinterval秒後に次の接続を開始する
+        （前の接続の終了を待たない）。
+      - どちらも指定が無い場合: 全ストリームを即座に（ほぼ同時に）開始する。
+
+    すべてのスレッドが完了するまでブロックする。
+    """
+    if not streams:
+        return
+
+    base_syn_time = streams[0]["syn_time"]
+    start_wall = time.monotonic()
+    threads = []
+
+    for i, stream in enumerate(streams, start=1):
+        if realtime:
+            start_delay = float(stream["syn_time"] - base_syn_time)
+        elif interval:
+            start_delay = (i - 1) * interval
+        else:
+            start_delay = 0.0
+
+        def launch(stream=stream, i=i, start_delay=start_delay):
+            remaining = start_delay - (time.monotonic() - start_wall)
+            if remaining > 0:
+                time.sleep(remaining)
+            replay_stream_worker(
+                stream, spoof_ip, dst_ip, dst_port_override, local_port_override, interval, realtime, iface, timeout,
+                label=f"{pass_num}周目 {i}/{len(streams)}",
+            )
+
+        t = threading.Thread(target=launch, daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+
 def replay_raw_tcp_sessions(
     pcap_path,
     src_ip,
@@ -397,43 +460,29 @@ def replay_raw_tcp_sessions(
                     print("        -> Device Bの応答（元pcap記録時）: なし")
         return
 
-    print(f"送信元IP {spoof_ip} で、{len(replayable)} 件の接続を順番に再現します")
+    print(f"送信元IP {spoof_ip} で、{len(replayable)} 件の接続を元のタイミング通りに（重複して）再現します")
+
+    effective_dst_port_for_probe = dst_port or replayable[0]["remote_port"]
 
     with ArpResponder(iface, spoof_ip):
         pass_num = 0
-        total_streams_sent = 0
+        total_passes_sent = 0
         while True:
             pass_num += 1
-            prev_syn_time = None
-            for stream_no, stream in enumerate(replayable, start=1):
-                if prev_syn_time is not None:
-                    wait_between_payloads(stream["syn_time"] - prev_syn_time, interval, realtime)
-                prev_syn_time = stream["syn_time"]
-
-                local_port = local_port_override or stream["local_port"]
-                this_dst_port = dst_port or stream["remote_port"]
-                print(f"[{pass_num}周目 {stream_no}/{len(replayable)}] local_port={local_port} でハンドシェイクを開始します")
-
-                offsets = establish_stream_session(stream, spoof_ip, dst_ip, this_dst_port, local_port, iface, timeout)
-                if offsets is None:
-                    continue
-                offset_local, offset_remote = offsets
-
-                send_raw_followups_round(
-                    stream, spoof_ip, dst_ip, this_dst_port, local_port, offset_local, offset_remote, interval, realtime, iface
-                )
-                total_streams_sent += 1
-
-                if until_disconnect:
-                    print(f"    生存確認します...")
-                    if not probe_target_alive(dst_ip, this_dst_port, timeout):
-                        print(
-                            f"対象が応答しなくなりました（{pass_num}周目、{stream_no}/{len(replayable)}件目の接続の後、"
-                            f"累計{total_streams_sent}件の接続を送信した時点）。クラッシュ/再起動と判断し停止します。"
-                        )
-                        return
-                    print("    生存確認OK。継続します...")
+            replay_streams_concurrently(
+                replayable, spoof_ip, dst_ip, dst_port, local_port_override, interval, realtime, iface, timeout, pass_num
+            )
+            total_passes_sent += 1
+            print(f"{pass_num}周目、全{len(replayable)}件の接続を送信完了。")
 
             if not until_disconnect:
                 return
-            print(f"{pass_num}周目、全{len(replayable)}件の接続を送信完了。最初から繰り返します...")
+
+            print("生存確認します...")
+            if not probe_target_alive(dst_ip, effective_dst_port_for_probe, timeout):
+                print(
+                    f"対象が応答しなくなりました（{pass_num}周目、全{len(replayable)}件の接続を送信した後）。"
+                    "クラッシュ/再起動と判断し停止します。"
+                )
+                return
+            print("生存確認OK。最初から繰り返します...")

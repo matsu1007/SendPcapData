@@ -126,13 +126,24 @@ pcapを1回走査しながら、複数ストリームを並行して追跡する
 
 1ストリームの `followups` を1周ぶん送信する。各要素の `seq`/`ack` に上記のオフセットを加算した新しい値を使い、フラグ・window・urgent pointer・予約ビット・オプションは元のまま `IP()/TCP()` を新規構築して送信する。戻り値は送信件数。
 
+### 並行実行: `replay_stream_worker(...)` / `replay_streams_concurrently(...)`
+
+元のファジングテストは、前の接続が閉じきる前に次の接続を開始する（同時に複数の接続がオープンになっている）ことがある。1ストリームずつ順番に処理する実装ではこの「重なり」を再現できないため、各ストリームを**別スレッドで並行に実行**する。
+
+- `replay_stream_worker` は1ストリームぶんの `establish_stream_session` → `send_raw_followups_round` をまとめた、スレッドの実行単位。
+- `replay_streams_concurrently` は `streams` の各要素に対して `threading.Thread` を1つずつ起動する。各スレッドの開始タイミングは:
+  - `realtime` 指定時: 最初のストリームの `syn_time` からの相対時間（`float(stream["syn_time"] - base_syn_time)`）だけ待ってから開始 — 元のpcapでのSYN同士の間隔を可能な限り正確に再現する。`pkt.time` はscapyの `EDecimal` 型なので `float()` で明示的に変換する必要がある（変換を忘れると `time.sleep()` が `TypeError` になる）。
+  - `interval` 指定時（`realtime` なし）: `i` 番目のストリームは `(i-1) * interval` 秒後に開始（前のストリームの終了を待たない）。
+  - どちらも指定が無ければ: 全ストリームをほぼ同時に開始する。
+  - 全スレッドの `join()` を待ってから関数が返る。
+
 ### 送信フェーズ: `replay_raw_tcp_sessions(...)`
 
 1. `extract_raw_tcp_streams` で全ストリームを復元し、`--src-port` が指定されていればそのポートのストリーム1件に絞り込む。`print_crash_summary` でクラッシュ推定地点を表示する。
 2. `followups` が空のストリーム（SYNのみで応答が無い等）は再現対象から除外する（`replayable` リスト）。
-3. `--dry-run` ならここで打ち切り、ストリームごとに再現対象パケットとその元の応答を表示して終了する。
-4. `ArpResponder` を1つ起動した状態で、`replayable` の各ストリームを順番に処理する: `establish_stream_session` → `send_raw_followups_round`。ストリーム間には（`--interval`/`--realtime` に応じて）元のpcapでのSYN同士の間隔を再現する待機を挟む。
-5. `until_disconnect` が真なら、`replayable` 全体を送り終えるたびに最初から繰り返す。**各ストリームの送信直後**に `probe_target_alive` で生存確認し、失敗した時点で「何周目・何件目のストリームで停止したか」を報告して終了する（`--tcp-session` 版が「1周＝1セッション内の全ペイロード」単位で確認するのに対し、こちらは「1ストリーム＝1接続」単位で確認しており、より細かい粒度でクラッシュ地点を特定できる）。
+3. `--dry-run` ならここで打ち切り、ストリームごとに再現対象パケットとその元の応答を表示して終了する（全接続の内容が同一なら `followups_signature` で検出し簡素化表示にする）。
+4. `ArpResponder` を1つ起動した状態で、`replay_streams_concurrently` を呼び `replayable` を1周ぶん（並行に）送信する。
+5. `until_disconnect` が真なら、1周送り終えるたびに `probe_target_alive` で生存確認し、失敗した時点で「何周目で停止したか」を報告して終了する。並行実行のため生存確認は「1ストリームごと」ではなく「1周（全ストリーム）ごと」に行う（`--tcp-session` 版と同じ粒度）。
 
 ## 主要な設計判断のまとめ
 
@@ -140,3 +151,4 @@ pcapを1回走査しながら、複数ストリームを並行して追跡する
 - **`--tcp-session` は通常`socket`、`--tcp-raw-session` は自前ハンドシェイク**: ファジング対象がペイロードかヘッダかで、必要な制御レベルが異なるため使い分けている。
 - **IPアドレス偽装 + ARP自動応答**: Windowsファイアウォールの設定変更なしに、自前TCPセッションに対するOSの妨害（自動RST）を回避するため。
 - **クラッシュ検知はモードごとに異なる方式**: `--tcp-session` は `sendall()` の例外、`--tcp-raw-session` は独立した `socket` 接続によるポーリング。生パケット送信には失敗通知が無いため、後者では能動的な生存確認が必須。
+- **`--tcp-raw-session` の複数接続はスレッドで並行実行**: 元のファジングテストが接続を閉じきる前に次の接続を開始することがあり、1件ずつ順番に処理するだけでは「同時に複数接続がオープンな状態」を再現できないため。
